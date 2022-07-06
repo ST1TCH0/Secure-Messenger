@@ -1,18 +1,21 @@
+import base64
 import datetime
 import io
 import socket
+import string
 import threading
 import queue
 import json
 import time
 import os
 
+from Crypto.Random import random, get_random_bytes
 from cryptom.Encryption import Encryptor
 
 
 class Connector:
 
-    def __init__(self):
+    def __init__(self, __window, __progress):
 
         self.__portToBind = 54321
         self.__portToConnect = 54322
@@ -21,23 +24,21 @@ class Connector:
         self_ip = socket.gethostbyname(socket.gethostname())
         self.__socketSender = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.__socketReceiver = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.__socketReceiver.bind(("25.69.215.100", self.__portToConnect))
+        self.__socketReceiver.settimeout(2)
+        self.__socketReceiver.bind(("0.0.0.0", self.__portToConnect))
         self.__socketReceiver.listen(5)
         self.__socketReceiver.setsockopt(
             socket.SOL_SOCKET,
             socket.SO_RCVBUF,
             1388)
-        self.__receiver = Receiver(self.__socketReceiver, self.__encryptor)
-        self.__sender = Sender(self.__socketSender, self.__encryptor)
+        self.__receiver = Receiver(self.__socketReceiver, self.__encryptor, __window, __progress)
+        self.__sender = Sender(self.__socketSender, self.__encryptor, __window, __progress)
         self.__receiver.start()
 
         self.selfPublicKey = None
         self.targetPublicKey = None
 
-
-
     def __del__(self):
-        self.__receiver.kill()
         return
 
     def createSender(self, ip):
@@ -45,7 +46,7 @@ class Connector:
             self.__socketSender.close()
 
         self.__socketSender = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.__socketSender.bind(("25.69.215.100", self.__portToBind))
+        self.__socketSender.bind(("0.0.0.0", self.__portToBind))
         self.__socketSender.connect((ip, self.__portToConnect))
 
         self.__sender.setSock(self.__socketSender)
@@ -53,6 +54,9 @@ class Connector:
 
     def getEncryptor(self):
         return self.__encryptor
+
+    def changeMode(self, mode):
+        self.__encryptor.changeMode(mode)
 
     def getSender(self):
         return self.__sender
@@ -69,7 +73,7 @@ class Connector:
 
 class Receiver(threading.Thread):
 
-    def __init__(self, socketReciver, __encryptor):
+    def __init__(self, socketReciver, __encryptor, __window, __progress):
 
         threading.Thread.__init__(self)
         self.__encryptor = __encryptor
@@ -85,6 +89,8 @@ class Receiver(threading.Thread):
         self.__conFlag = False
         self.enKey = None
         self.connected = False
+        self.progress = 0
+
 
     def __del__(self):
         self.kill()
@@ -96,25 +102,33 @@ class Receiver(threading.Thread):
     def setConFlag(self, flag):
         self.__conFlag = flag
 
+    def setConn(self, conn):
+        self.__conn = conn
+
     def run(self):
         msg = None
         while self.__running:
-            if self.__conn is None:
-                self.__conn, self.__target_address = self.__socketReceiver.accept()
-                print(self.__target_address)
             try:
+                if self.__conn is None:
+                    self.__conn, self.__target_address = self.__socketReceiver.accept()
+                    print(self.__target_address)
+                    msg = self.__conn.recv(2048)
+                    if not self.connected:
+                        if self.__conFlag:
+                            self.__encryptor.decryptSessionKey(msg)
+                            print("session key decrypted")
+                        else:
+                            self.enKey = self.__encryptor.createSessionKey(msg.decode())
+                            print("session key encrypted")
+                        self.connected = True
+                        msg = None
+                        self.__target_address = None
                 msg = self.__conn.recv(2048)
-                if not self.connected:
-                    if self.__conFlag:
-                        self.__encryptor.decryptSessionKey(msg)
-                        print("session key decrypted")
-                    else:
-                        self.enKey = self.__encryptor.createSessionKey(msg.decode())
-                        print("session key encrypted")
-                    self.connected = True
-                    msg = None
             except socket.error:
                 print("Socket recieving error")
+                self.__encryptor.setSessionKey(None)
+                self.__conn = None
+                self.connected = False
             if msg and self.__encryptor.getSessionKey():
                 msg = self.__encryptor.decryptBlock(msg).decode()
                 try:
@@ -132,13 +146,13 @@ class Receiver(threading.Thread):
                                 temp.write(buff)
                             buff = self.__conn.recv(2048)
                         temp = open("temp", "rb")
-                        buff = temp.read(43712)
+                        buff = temp.read(test["blocks"])
                         print("received DONE")
 
                         f = open(self.__downloadsPath + os.path.basename(test["name"]) + test["ext"], "wb")
                         while buff:
-                            f.write(self.__encryptor.decryptBlock(buff))
-                            buff = temp.read(43712)
+                            f.write(self.__encryptor.decryptBlockType(buff, test['cypher'], test['iv'].encode()))
+                            buff = temp.read(test["blocks"])
                         f.close()
                         print("downloaded DONE")
                 except ValueError as e:
@@ -159,6 +173,9 @@ class Receiver(threading.Thread):
     def setAddress(self, address):
         self.__target_address = address
 
+    def getProgress(self):
+        return self.progress
+
     def kill(self):
         self.__running = False
 
@@ -168,12 +185,15 @@ class Receiver(threading.Thread):
 
 class Sender:
 
-    def __init__(self, ___socketSender, __encryptor):
+    def __init__(self, ___socketSender, __encryptor, __window, __progress):
         self.__encryptor = __encryptor
         self.__conn = None
         self.__target_address = None
         self.__socketSender = ___socketSender
         self.__messages_to_show = queue.LifoQueue()
+        self.progress = __progress
+        self.window = __window
+        self.cyphtype = "ECB"
 
     def __del__(self):
         return
@@ -181,8 +201,15 @@ class Sender:
     def setTargetAddress(self, address):
         self.__target_address = address
 
+    def addProgress(self, state):
+        self.progress['value'] = state
+        self.window.update()
+
     def setSock(self, _sock):
         self.__socketSender = _sock
+
+    def setCyphType(self, type):
+        self.cyphtype = type
 
     def sendMessage(self, msg):
         print(msg)
@@ -192,22 +219,38 @@ class Sender:
 
     def sendFile(self, file):
         file_name, file_extension = os.path.splitext(file)
+        file_size = os.path.getsize(file)
+
+        f = open(file, 'rb')
+        buff = f.read(8 * 1024)
+
+        letters = string.ascii_lowercase
+
+        iv = ''.join(random.choice(letters) for i in range(16))
+
+        blocksize = len(self.__encryptor.encryptBlockType(buff, self.cyphtype, iv.encode()))
+
         filePar = json.dumps({
             "name": file_name,
-            "ext": file_extension
+            "ext": file_extension,
+            "blocks": blocksize,
+            "size": file_size,
+            "cypher": self.cyphtype,
+            "iv": iv
         })
         msg = filePar.encode()
         msg = self.__encryptor.encryptBlock(msg)
         self.__socketSender.send(msg)
 
-        f = open(file, 'rb')
-        buff = f.read(8 * 1024)
         print("Sending...")
+        pr = int(0)
         while buff:
-            self.__socketSender.send(self.__encryptor.encryptBlock(buff))
+            pr += int(8 * 1024 / file_size * 100)
+            self.addProgress(pr)
+            self.__socketSender.send(self.__encryptor.encryptBlockType(buff, self.cyphtype, iv.encode()))
             buff = f.read(8 * 1024)
 
-        time.sleep(3)
+        time.sleep(10)
 
         self.__socketSender.send(b"DONE")
         print("Sending DONE")
